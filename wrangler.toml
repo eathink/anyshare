@@ -1,0 +1,7 @@
+name = "anyshare"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[[kv_namespaces]]
+binding = "STORAGE"
+id = "9582b4fe442b46ba898998269af3590c"
