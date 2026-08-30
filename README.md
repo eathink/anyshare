@@ -6,6 +6,10 @@
 
 - 上传 **文本 / Markdown / 图片 / 文件**，生成 6 位 Base62 短码
 - 访问地址 `/share/{code}`：文本直接展示、图片直接显示、文件提供下载
+- **阅后即焚**：可选"首次访问后销毁"（文本/图片在首次浏览页面时销毁，文件在首次下载时销毁）
+- **文本文件在线预览**：txt / json / csv / md 文件直接在页面展示（json 自动格式化，md 渲染）
+- **剪贴板贴图**：首页支持 Ctrl+V 直接粘贴图片上传
+- **二维码**：创建成功后展示分享链接二维码，资源页也带二维码便于转发
 - 自动过期（默认 24 小时，可选 1h / 24h / 72h），由 KV `expirationTtl` 自动删除
 - 单资源最大 10MB，文件类型白名单，拒绝 HTML/脚本/SVG 等可注入类型
 - 简单 IP 限流（每分钟 10 次上传）
@@ -65,12 +69,15 @@ curl -X POST http://localhost:8787/api/upload \
 - `content`: 文本为原文；图片/文件为 base64（不带 data: 前缀）
 - `filename`: 图片/文件必填
 - `ttl`: 3600 / 86400 / 259200，缺省 24 小时
+- `burn`: 可选 `true`，阅后即焚
 
 返回：
 
 ```json
-{ "code": "aB3xY9", "url": "/share/aB3xY9", "expireAt": 1755625200000 }
+{ "code": "aB3xY9", "url": "/share/aB3xY9", "qr": "<svg ...>", "expireAt": 1755625200000 }
 ```
+
+`qr` 为分享链接二维码的 SVG，可直接嵌入 HTML。
 
 ### 获取资源
 
@@ -94,7 +101,8 @@ key: 短码，value:
   "filename": "",
   "size": 11,
   "createdAt": 1755538800000,
-  "expireAt": 1755625200000
+  "expireAt": 1755625200000,
+  "burn": false
 }
 ```
 

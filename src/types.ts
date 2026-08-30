@@ -8,6 +8,8 @@ export interface ResourceRecord {
   size: number;
   createdAt: number;
   expireAt: number;
+  /** 阅后即焚：首次访问内容后销毁（旧记录无此字段按 false 处理） */
+  burn?: boolean;
 }
 
 export interface UploadResponse {

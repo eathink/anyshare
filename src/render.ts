@@ -1,5 +1,12 @@
+import { toString as qrToString } from "qrcode";
 import { marked, Renderer, type Tokens } from "marked";
 import type { ResourceRecord } from "./types";
+import { base64ToBytes, fileExt, mimeFromName } from "./util";
+
+/** 生成分享链接的二维码 SVG（qrcode 纯字符串渲染，兼容 Workers） */
+export function qrSvg(url: string): Promise<string> {
+  return qrToString(url, { type: "svg", margin: 1, width: 140 });
+}
 
 function escapeHtml(s: string): string {
   return s
@@ -56,6 +63,11 @@ textarea {
 textarea:focus, select:focus { outline: none; border-color: #666; }
 select, input[type=file] { font: inherit; }
 select { padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background: #fff; }
+.burn-row { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #666; margin: 12px 0 0; cursor: pointer; }
+.burn-row input { margin: 0; }
+.notice { color: #b35900; font-size: 13px; margin: 8px 0 0; }
+.qr { margin: 16px 0 0; text-align: center; }
+.qr svg { background: #fff; padding: 6px; border: 1px solid #eee; border-radius: 3px; }
 .file-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .file-name { color: #666; font-size: 13px; word-break: break-all; }
 button {
@@ -136,11 +148,15 @@ export function renderHome(): string {
     <option value="86400" selected>24 小时</option>
     <option value="259200">72 小时</option>
   </select>
+  <label class="burn-row" for="burn">
+    <input type="checkbox" id="burn"> 阅后即焚（首次访问后销毁，链接失效）
+  </label>
   <button id="create">创建分享链接</button>
   <div class="error" id="error"></div>
   <div class="result" id="result">
     分享链接：<a id="link" href=""></a>
     <button id="copy" type="button" style="margin-top:8px;padding:4px 12px;font-size:13px">复制链接</button>
+    <div class="qr" id="qr"></div>
   </div>
 </div>`;
 
@@ -148,6 +164,22 @@ export function renderHome(): string {
 const $ = (id) => document.getElementById(id);
 $("file").addEventListener("change", () => {
   $("fileName").textContent = $("file").files[0] ? $("file").files[0].name : "";
+});
+// 粘贴板贴图：Ctrl+V 直接把剪贴板图片当作待上传文件
+document.addEventListener("paste", (e) => {
+  const items = e.clipboardData ? e.clipboardData.items : [];
+  for (const item of items) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const file = item.getAsFile();
+      if (!file) return;
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      $("file").files = dt.files;
+      $("fileName").textContent = file.name || "剪贴板图片";
+      e.preventDefault();
+      return;
+    }
+  }
 });
 function showError(msg) {
   const e = $("error");
@@ -184,6 +216,7 @@ $("create").addEventListener("click", async () => {
       payload = { type: $("type").value, content: text };
     }
     payload.ttl = parseInt($("ttl").value, 10);
+    payload.burn = $("burn").checked;
     const res = await fetch("/api/upload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -194,6 +227,7 @@ $("create").addEventListener("click", async () => {
     const url = location.origin + "/share/" + data.code;
     $("link").textContent = url;
     $("link").href = url;
+    $("qr").innerHTML = data.qr || "";
     $("result").style.display = "block";
   } catch (err) {
     showError(err.message || String(err));
@@ -211,8 +245,18 @@ $("copy").addEventListener("click", async () => {
   return page("分享", body, script);
 }
 
-/** 资源页：按类型展示内容 + 下载按钮 + 创建/剩余时间 */
-export function renderShare(code: string, record: ResourceRecord): string {
+/** FILE 记录的 base64 内容 -> 文本（仅用于文本类文件预览） */
+function decodeFileText(record: ResourceRecord): string {
+  return new TextDecoder().decode(base64ToBytes(record.content));
+}
+
+/** 资源页：按类型展示内容 + 下载按钮 + 二维码 + 创建/剩余时间 */
+export async function renderShare(
+  code: string,
+  record: ResourceRecord,
+  pageUrl: string
+): Promise<string> {
+  const burn = record.burn === true;
   // MARKDOWN server-rendered; only TEXT ships content to the client
   const dataObj: Record<string, unknown> = {
     code,
@@ -221,6 +265,7 @@ export function renderShare(code: string, record: ResourceRecord): string {
     size: record.size,
     createdAt: record.createdAt,
     expireAt: record.expireAt,
+    burn,
   };
   if (record.type === "TEXT") dataObj.content = record.content;
   const data = JSON.stringify(dataObj)
@@ -228,21 +273,55 @@ export function renderShare(code: string, record: ResourceRecord): string {
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
 
+  // 阅后即焚提示：TEXT/MARKDOWN/IMAGE 内容内嵌页面、渲染即销毁；FILE 首次下载后销毁
+  const pageBurn = burn && record.type !== "FILE";
+  const burnNotice = pageBurn
+    ? `<div class="notice">🔥 阅后即焚：本次浏览后即销毁，刷新或再次访问将不可见</div>`
+    : burn
+      ? `<div class="notice">🔥 阅后即焚：首次下载后自动销毁</div>`
+      : "";
+
   let body: string;
   if (record.type === "TEXT") {
-    body = `<div class="box"><h1>文本分享</h1><pre class="content" id="content"></pre>`;
+    body = `<div class="box"><h1>文本分享</h1>${burnNotice}<pre class="content" id="content"></pre>`;
   } else if (record.type === "MARKDOWN") {
-    body = `<div class="box"><h1>Markdown 分享</h1><div class="md">${renderMarkdown(
+    body = `<div class="box"><h1>Markdown 分享</h1>${burnNotice}<div class="md">${renderMarkdown(
       record.content
     )}</div>`;
   } else if (record.type === "IMAGE") {
-    body = `<div class="box"><h1>图片分享</h1><img class="image" id="content" alt="shared image">`;
+    // 阅后即焚时内嵌 data URI，页面渲染即视为已读
+    const src = burn
+      ? `data:${mimeFromName(record.filename)};base64,${record.content}`
+      : `/share/${code}/download`;
+    body = `<div class="box"><h1>图片分享</h1>${burnNotice}<img class="image" src="${src}" alt="shared image">`;
   } else {
-    body = `<div class="box"><h1>文件分享</h1><pre class="content">📄 ${escapeHtml(
-      record.filename || code
-    )}</pre>`;
+    // FILE：文本类文件（txt/json/csv/md）在线预览，其余显示文件名
+    const ext = fileExt(record.filename);
+    if (ext === "md") {
+      body = `<div class="box"><h1>文件分享</h1>${burnNotice}<div class="md">${renderMarkdown(
+        decodeFileText(record)
+      )}</div>`;
+    } else if (ext === "txt" || ext === "csv" || ext === "json") {
+      let text = decodeFileText(record);
+      if (ext === "json") {
+        try {
+          text = JSON.stringify(JSON.parse(text), null, 2);
+        } catch {
+          // 非法 JSON 按原文展示
+        }
+      }
+      body = `<div class="box"><h1>文件分享</h1>${burnNotice}<pre class="content">${escapeHtml(
+        text
+      )}</pre>`;
+    } else {
+      body = `<div class="box"><h1>文件分享</h1>${burnNotice}<pre class="content">📄 ${escapeHtml(
+        record.filename || code
+      )}</pre>`;
+    }
   }
 
+  // 阅后即焚的 TEXT/MARKDOWN/IMAGE 内容已在页面上，无需再提供下载入口
+  const showDownload = !pageBurn;
   body += `
   <div class="meta">
     <span id="created"></span>
@@ -250,7 +329,8 @@ export function renderShare(code: string, record: ResourceRecord): string {
     <span id="size"></span>
   </div>
   <div class="meta"><span class="countdown" id="countdown"></span></div>
-  <a href="/share/${code}/download" download><button>下载</button></a>
+  <div class="qr">${await qrSvg(pageUrl)}</div>
+  ${showDownload ? `<a href="/share/${code}/download" download><button>下载</button></a>` : ""}
 </div>`;
 
   const script = `
@@ -276,11 +356,14 @@ function countdown() {
   $("countdown").textContent = "剩余 " + (h > 0 ? h + " 小时 " : "") + m + " 分 " + s + " 秒";
   setTimeout(countdown, 1000);
 }
-countdown();
+// 阅后即焚且已随页面销毁的资源，倒计时无意义
+if (DATA.burn && DATA.type !== "FILE") {
+  $("countdown").textContent = "已销毁";
+} else {
+  countdown();
+}
 if (DATA.type === "TEXT") {
   $("content").textContent = DATA.content;
-} else if (DATA.type === "IMAGE") {
-  $("content").src = "/share/" + DATA.code + "/download";
 }`;
 
   return page(`分享 ${code}`, body, script);

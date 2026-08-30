@@ -1,6 +1,6 @@
 import { generateUniqueCode } from "./code";
 import { clientIp, rateLimit } from "./limit";
-import { renderExpired, renderHome, renderShare } from "./render";
+import { qrSvg, renderExpired, renderHome, renderShare } from "./render";
 import {
   BLOCKED_EXT,
   DEFAULT_TTL,
@@ -11,6 +11,7 @@ import {
   type ResourceRecord,
   type ResourceType,
 } from "./types";
+import { base64ToBytes, fileExt, mimeFromName } from "./util";
 
 interface Env {
   STORAGE: KVNamespace;
@@ -20,19 +21,6 @@ const JSON_HEADERS = { "Content-Type": "application/json; charset=utf-8" };
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
-}
-
-/** base64 字符串 -> Uint8Array（按字节计算真实大小） */
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-function fileExt(filename: string): string {
-  const i = filename.lastIndexOf(".");
-  return i === -1 ? "" : filename.slice(i + 1).toLowerCase();
 }
 
 /** 校验上传负载，返回错误信息或 null */
@@ -69,28 +57,6 @@ function validate(payload: {
   return null;
 }
 
-function mimeFromName(filename: string): string {
-  const ext = fileExt(filename);
-  const map: Record<string, string> = {
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    pdf: "application/pdf",
-    zip: "application/zip",
-    txt: "text/plain",
-    json: "application/json",
-    csv: "text/csv",
-    md: "text/markdown",
-    mp3: "audio/mpeg",
-    mp4: "video/mp4",
-    ogg: "audio/ogg",
-    wav: "audio/wav",
-  };
-  return map[ext] || "application/octet-stream";
-}
-
 async function getRecord(
   env: Env,
   code: string
@@ -123,11 +89,21 @@ export default {
         return json({ error: "请求过于频繁，请稍后再试" }, 429);
       }
 
+      // 先看 Content-Length 提前拒绝：文件经 base64 膨胀 4/3，再加 JSON 外壳开销
+      const contentLength = Number(request.headers.get("Content-Length"));
+      if (
+        Number.isFinite(contentLength) &&
+        contentLength > MAX_SIZE * 1.4 + 2048
+      ) {
+        return json({ error: "请求体超过大小限制" }, 413);
+      }
+
       let payload: {
         type: ResourceType;
         content: string;
         filename?: string;
         ttl?: number;
+        burn?: boolean;
       };
       try {
         payload = await request.json();
@@ -153,7 +129,13 @@ export default {
         }
       }
 
-      const code = await generateUniqueCode((c) => env.STORAGE.get(c));
+      let code: string;
+      try {
+        code = await generateUniqueCode((c) => env.STORAGE.get(c));
+      } catch {
+        // 短码连续冲突，概率极低，提示重试即可
+        return json({ error: "创建失败，请重试" }, 500);
+      }
       const record: ResourceRecord = {
         type: payload.type,
         content: payload.content,
@@ -161,6 +143,7 @@ export default {
         size,
         createdAt: Date.now(),
         expireAt: Date.now() + ttl * 1000,
+        burn: payload.burn === true,
       };
 
       // expirationTtl 最低 60 秒
@@ -168,7 +151,13 @@ export default {
         expirationTtl: Math.max(60, ttl),
       });
 
-      return json({ code, url: `/share/${code}`, expireAt: record.expireAt });
+      const shareUrl = `${new URL(request.url).origin}/share/${code}`;
+      return json({
+        code,
+        url: `/share/${code}`,
+        qr: await qrSvg(shareUrl),
+        expireAt: record.expireAt,
+      });
     }
 
     // ---------- 获取资源（API） ----------
@@ -176,6 +165,8 @@ export default {
     if (request.method === "GET" && apiMatch) {
       const record = await getRecord(env, apiMatch[1]);
       if (!record) return json({ error: "资源不存在或已过期" }, 404);
+      // 阅后即焚：内容已被读取（在内存中），直接销毁
+      if (record.burn) await env.STORAGE.delete(apiMatch[1]);
       return json(record);
     }
 
@@ -204,20 +195,30 @@ export default {
         )}`,
         "Cache-Control": "no-store",
       };
+      // 阅后即焚：字节已读入内存，返回前销毁
+      if (record.burn) await env.STORAGE.delete(code);
       return new Response(bytes as unknown as BodyInit, { headers });
     }
 
     // ---------- 资源页面 ----------
     const shareMatch = pathname.match(/^\/share\/([A-Za-z0-9]{6})$/);
     if (request.method === "GET" && shareMatch) {
-      const record = await getRecord(env, shareMatch[1]);
+      const code = shareMatch[1];
+      const record = await getRecord(env, code);
       if (!record) {
         return new Response(renderExpired(), {
           status: 404,
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }
-      return new Response(renderShare(shareMatch[1], record), {
+      const pageUrl = `${new URL(request.url).origin}/share/${code}`;
+      const html = await renderShare(code, record, pageUrl);
+      // 阅后即焚：TEXT/MARKDOWN/IMAGE 内容已内嵌进页面，渲染即销毁；
+      // FILE 类型在首次下载时销毁（见 /download 路由）
+      if (record.burn && record.type !== "FILE") {
+        await env.STORAGE.delete(code);
+      }
+      return new Response(html, {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
