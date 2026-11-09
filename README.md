@@ -2,6 +2,8 @@
 
 匿名、无账号、自动过期的互联网临时空间。基于 Cloudflare Worker + Workers KV，无需数据库。
 
+[![CI](https://github.com/eathink/anyshare/actions/workflows/ci.yml/badge.svg)](https://github.com/eathink/anyshare/actions/workflows/ci.yml)
+
 ## 功能
 
 - 上传 **文本 / Markdown / 图片 / 文件**，生成 6 位 Base62 短码
